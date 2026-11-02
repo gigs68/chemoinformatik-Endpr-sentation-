@@ -1,0 +1,166 @@
+# ===== EGFR WT vs. T790M: Gefitinib & Osimertinib, Docking-Pipeline =====
+# 1) Installation (1-2 min). Falls Colab danach einen Neustart verlangt: Zelle erneut ausführen.
+%pip -q install rdkit vina meeko gemmi biopython pandas matplotlib requests openbabel-wheel
+
+import os, sys, json, subprocess, requests, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from Bio.PDB import PDBParser, PDBIO, Select
+from rdkit import Chem, RDLogger
+from rdkit.Chem import AllChem, rdMolAlign
+from meeko import MoleculePreparation, PDBQTWriterLegacy, PDBQTMolecule, RDKitMolCreate
+from vina import Vina
+RDLogger.DisableLog('rdApp.warning')
+os.makedirs('work', exist_ok=True)
+
+# 2) Konfiguration
+LIGANDS = {
+  'Gefitinib':   'COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1',
+  'Osimertinib': 'COc1cc(N(C)CCN(C)C)c(NC(=O)C=C)cc1Nc1nccc(-c2cn(C)c3ccccc23)n1',
+}
+# (PDB-ID, Zustand, Ko-Ligand-Code, Kette, Ko-Ligand-Name)
+RECEPTORS = [
+  ('4WKQ','WT',          'IRE','A','Gefitinib'),
+  ('6JXT','WT',          'YY3','A','Osimertinib'),
+  ('6JX4','T790M',       'YY3','A','Osimertinib'),
+  ('3UG2','G719S/T790M', 'IRE','A','Gefitinib'),
+]
+BOX = 22.0            # Boxkante in Angstrom
+EXHAUSTIVENESS = 16   # 8 = schneller Test
+SEED = 42
+
+# 3) Strukturen laden, Protein/Ligand trennen, Box-Zentrum (= ChimeraX: measure center)
+def fetch(pdb):
+    p = f'work/{pdb}.pdb'
+    if not os.path.exists(p):
+        r = requests.get(f'https://files.rcsb.org/download/{pdb}.pdb', timeout=60); r.raise_for_status()
+        open(p, 'w').write(r.text)
+    return p
+
+class ProtSel(Select):
+    def __init__(s, chain): s.chain = chain
+    def accept_chain(s, c): return c.id == s.chain
+    def accept_residue(s, r): return r.id[0] == ' '
+    def accept_atom(s, a): return a.get_altloc() in (' ', 'A')
+
+class LigSel(Select):
+    def __init__(s, chain, code): s.chain, s.code = chain, code
+    def accept_chain(s, c): return c.id == s.chain
+    def accept_residue(s, r): return r.get_resname() == s.code
+    def accept_atom(s, a): return a.get_altloc() in (' ', 'A')
+
+def prepare(pdb, code, chain):
+    st = PDBParser(QUIET=True).get_structure(pdb, fetch(pdb))
+    het = [(r.get_resname(), len(r)) for r in st[0][chain] if r.id[0].startswith('H_')]
+    if code not in [h[0] for h in het]:
+        print(f'  ! Code {code} nicht in {pdb} Kette {chain}. Gefundene HETATM: {het}')
+        code = max(het, key=lambda h: h[1])[0]; print(f'  -> verwende groesste Gruppe: {code}')
+    io = PDBIO(); io.set_structure(st)
+    io.save(f'work/{pdb}_prot.pdb', ProtSel(chain)); io.save(f'work/{pdb}_lig.pdb', LigSel(chain, code))
+    lig = Chem.MolFromPDBFile(f'work/{pdb}_lig.pdb', removeHs=False)
+    return lig.GetConformer().GetPositions().mean(axis=0), code
+
+info = {}
+for pdb, state, code, ch, nm in RECEPTORS:
+    c, code = prepare(pdb, code, ch); info[pdb] = dict(state=state, code=code, centre=c, lig=nm)
+    print(pdb, state, code, 'Box-Zentrum', np.round(c, 2))
+
+# 4) Rezeptor-PDBQT (Open Babel in eigenem Prozess: H bei pH 7.4, Ladungen, starr)
+OB_SCRIPT = '''
+import sys
+from openbabel import pybel
+mol = next(pybel.readfile('pdb', sys.argv[1]))
+mol.OBMol.AddHydrogens(False, True, 7.4)
+mol.write('pdbqt', sys.argv[2], overwrite=True, opt={'r': None})
+'''
+def make_receptor(pdb):
+    r = subprocess.run([sys.executable, '-c', OB_SCRIPT, f'work/{pdb}_prot.pdb', f'work/{pdb}_rec.pdbqt'],
+                       capture_output=True, text=True)
+    assert os.path.exists(f'work/{pdb}_rec.pdbqt'), r.stderr[-500:]
+for pdb in info: make_receptor(pdb); print(pdb, 'Rezeptor OK')
+
+# 5) Liganden vorbereiten
+def lig_pdbqt(smiles, name):
+    m = Chem.AddHs(Chem.MolFromSmiles(smiles)); AllChem.EmbedMolecule(m, randomSeed=SEED); AllChem.MMFFOptimizeMolecule(m)
+    setup = MoleculePreparation().prepare(m)[0]
+    s, ok, err = PDBQTWriterLegacy.write_string(setup); assert ok, err
+    open(f'work/{name}.pdbqt', 'w').write(s)
+for n, s in LIGANDS.items(): lig_pdbqt(s, n)
+print('Liganden OK')
+
+# 6) Docking- und Analysefunktionen
+def dock(pdb, lig, n_poses=9):
+    v = Vina(sf_name='vina', seed=SEED, verbosity=0)
+    v.set_receptor(f'work/{pdb}_rec.pdbqt'); v.set_ligand_from_file(f'work/{lig}.pdbqt')
+    v.compute_vina_maps(center=[float(x) for x in info[pdb]['centre']], box_size=[BOX]*3)
+    v.dock(exhaustiveness=EXHAUSTIVENESS, n_poses=n_poses)
+    out = f'work/{pdb}_{lig}_out.pdbqt'; v.write_poses(out, n_poses=n_poses, overwrite=True)
+    return v.energies(n_poses=n_poses)[:, 0], out
+
+def single_conf(mol, cid):
+    m = Chem.Mol(mol); c = Chem.Conformer(mol.GetConformer(cid)); m.RemoveAllConformers(); m.AddConformer(c, assignId=True); return m
+
+def rmsd_to_crystal(pdb, lig, pose):
+    try:
+        ref = Chem.MolFromPDBFile(f'work/{pdb}_lig.pdb', removeHs=True)
+        ref = AllChem.AssignBondOrdersFromTemplate(Chem.RemoveHs(Chem.MolFromSmiles(LIGANDS[lig])), ref)
+        return rdMolAlign.CalcRMS(Chem.RemoveHs(pose), ref)
+    except Exception as e:
+        print('  RMSD nicht berechenbar:', e); return float('nan')
+
+_prot = {}
+def prot(pdb):
+    if pdb not in _prot: _prot[pdb] = PDBParser(QUIET=True).get_structure(pdb, f'work/{pdb}_prot.pdb')[0]
+    return _prot[pdb]
+def residue(model, num):
+    for r in model.get_residues():
+        if r.id[1] == num and r.id[0] == ' ': return r
+
+def interactions(pdb, mol):
+    model = prot(pdb); xyz = mol.GetConformer().GetPositions(); sym = [a.GetSymbol() for a in mol.GetAtoms()]
+    res = {}; met = residue(model, 793); r790 = residue(model, 790)
+    nN = [i for i, s in enumerate(sym) if s == 'N']
+    res['d_Met793N_ligN'] = float(min(np.linalg.norm(xyz[i] - met['N'].coord) for i in nN)) if met else np.nan
+    if r790:
+        h = np.array([a.coord for a in r790 if a.element != 'H']); d = np.linalg.norm(h[:, None, :] - xyz[None, :, :], axis=2)
+        res['res790'] = r790.get_resname(); res['d_res790_min'] = float(d.min())
+        res['n_ligand_atoms_within_4A_of_790'] = int((d.min(axis=0) < 4.0).sum())
+    patt = Chem.MolFromSmarts('[CH2]=[CH]C(=O)N')
+    if mol.HasSubstructMatch(patt):
+        cys = residue(model, 797)
+        if cys is not None and 'SG' in cys:
+            res['d_warhead_Cys797SG'] = float(np.linalg.norm(xyz[mol.GetSubstructMatch(patt)[0]] - cys['SG'].coord))
+    return res
+
+# 7) Docking aller Paare; Paare Ko-Ligand/eigene Struktur = REDOCKING (Erfolg: RMSD <= 2 A)
+rows = []
+for pdb, state, code, ch, own in RECEPTORS:
+    for lig in LIGANDS:
+        sc, out = dock(pdb, lig)
+        mol = RDKitMolCreate.from_pdbqt_mol(PDBQTMolecule.from_file(out, skip_typing=True))[0]
+        r = dict(pdb=pdb, state=state, ligand=lig, is_redocking=(lig == own),
+                 vina_top1=float(sc[0]), vina_mean_top3=float(np.mean(sc[:3])))
+        if lig == own:
+            rms = [rmsd_to_crystal(pdb, lig, single_conf(mol, i)) for i in range(mol.GetNumConformers())]
+            r['rmsd_top1'] = rms[0]; r['rmsd_best'] = float(np.nanmin(rms)) if not all(np.isnan(rms)) else np.nan
+        r.update(interactions(pdb, single_conf(mol, 0))); rows.append(r)
+        print(pdb, lig, 'Top-1', round(sc[0], 2), 'kcal/mol')
+
+res = pd.DataFrame(rows); res.to_csv('docking_results.csv', index=False)
+red = res[res.is_redocking][['pdb', 'state', 'ligand', 'rmsd_top1', 'rmsd_best', 'vina_top1']]
+red.to_csv('redocking.csv', index=False)
+print('\n=== REDOCKING (Erfolg: RMSD <= 2 A) ==='); print(red.round(2).to_string(index=False))
+if not (red.rmsd_top1 <= 2).any():
+    print('\n>>> ACHTUNG: Kein Redocking erfolgreich. Scores NICHT interpretieren (Failure-Folie).')
+print('\n=== DOCKING ===')
+print(res.drop(columns=['is_redocking', 'rmsd_top1', 'rmsd_best'], errors='ignore').round(2).to_string(index=False))
+
+# 8) Plot und Download
+piv = res.pivot(index='pdb', columns='ligand', values='vina_top1').loc[[r[0] for r in RECEPTORS]]
+ax = piv.plot.bar(figsize=(7, 4), color=['#2E6F95', '#D1495B']); ax.set_ylabel('Vina-Score (kcal/mol, negativer = besser)')
+ax.set_title('Vina-Top-1-Score je Struktur und Ligand'); plt.xticks(rotation=0); plt.tight_layout()
+plt.savefig('docking_scores.png', dpi=200); plt.show()
+json.dump(res.replace({np.nan: None}).to_dict('records'), open('results.json', 'w'), indent=1)
+try:
+    from google.colab import files
+    for f in ['redocking.csv', 'docking_results.csv', 'results.json', 'docking_scores.png']: files.download(f)
+except ImportError:
+    print('Nicht in Colab: Dateien liegen im aktuellen Ordner.')
