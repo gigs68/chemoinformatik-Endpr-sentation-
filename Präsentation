@@ -1,0 +1,45 @@
+# EGFR WT vs. T790M: Docking-Projekt
+
+Klick auf das Badge öffnet das Notebook direkt in Google Colab:
+
+[![In Colab öffnen](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BENUTZERNAME/REPO/blob/main/EGFR_docking_pipeline.ipynb)
+
+## Ausführen
+1. Badge anklicken (Google-Login nötig).
+2. In Colab: **Laufzeit → Alle ausführen**.
+3. Die Ergebnisse (`redocking.csv`, `docking_results.csv`, `results.json`) vor dem Schließen herunterladen.
+import json, math
+from rdkit import Chem, DataStructs
+from rdkit.Chem import Descriptors, Crippen, rdMolDescriptors, QED, Draw, AllChem
+from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
+smi = {
+ "Gefitinib":  "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1",
+ "Osimertinib":"COc1cc(N(C)CCN(C)C)c(NC(=O)C=C)cc1Nc1nccc(-c2cn(C)c3ccccc23)n1",
+}
+pb = FilterCatalogParams(); pb.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+br = FilterCatalogParams(); br.AddCatalog(FilterCatalogParams.FilterCatalogs.BRENK)
+fp_pains, fp_brenk = FilterCatalog(pb), FilterCatalog(br)
+out, mols = {}, {}
+for n,s in smi.items():
+    m = Chem.MolFromSmiles(s); mols[n]=m
+    lip = sum([Descriptors.MolWt(m)>500, rdMolDescriptors.CalcNumHBD(m)>5, rdMolDescriptors.CalcNumHBA(m)>10, Crippen.MolLogP(m)>5])
+    out[n] = dict(formula=rdMolDescriptors.CalcMolFormula(m), MW=Descriptors.MolWt(m), logP=Crippen.MolLogP(m),
+      HBD=rdMolDescriptors.CalcNumHBD(m), HBA=rdMolDescriptors.CalcNumHBA(m), TPSA=rdMolDescriptors.CalcTPSA(m),
+      RotB=rdMolDescriptors.CalcNumRotatableBonds(m), AromRings=rdMolDescriptors.CalcNumAromaticRings(m),
+      HeavyAtoms=m.GetNumHeavyAtoms(), Lipinski_viol=lip, QED=QED.qed(m),
+      PAINS=len(fp_pains.GetMatches(m)), Brenk=[e.GetDescription() for e in fp_brenk.GetMatches(m)],
+      canon=Chem.MolToSmiles(m), inchikey=Chem.MolToInchiKey(m))
+fa = AllChem.GetMorganFingerprintAsBitVect(mols["Gefitinib"],2,2048); fb = AllChem.GetMorganFingerprintAsBitVect(mols["Osimertinib"],2,2048)
+out["tanimoto_morgan2"] = DataStructs.TanimotoSimilarity(fa,fb)
+# Bemis-Murcko
+from rdkit.Chem.Scaffolds import MurckoScaffold
+for n,m in mols.items(): out[n]["scaffold"]=Chem.MolToSmiles(MurckoScaffold.GetScaffoldForMol(m))
+# Literatur-Messwerte (aus Folie 4 der Projektpräsentation)
+data = [("Gefitinib","WT","Kd",35.3),("Gefitinib","T790M","Kd",4.6),("Gefitinib","L858R/T790M","Kd",10.9),
+        ("Osimertinib","WT","IC50 (Enzym)",184),("Osimertinib","L858R/T790M","IC50 (Enzym)",1),
+        ("Osimertinib","WT (LoVo)","IC50 (Zelle)",480),("Osimertinib","L858R/T790M (H1975)","IC50 (Zelle)",15)]
+out["potency"]=[dict(ligand=a,protein=b,measure=c,nM=d,p=-math.log10(d*1e-9)) for a,b,c,d in data]
+out["ratios"]=dict(gef_WT_over_T790M_Kd=35.3/4.6, osi_enz_WT_over_mut=184/1, osi_cell_WT_over_mut=480/15)
+json.dump(out, open("analysis.json","w"), indent=1, default=str)
+for n,m in mols.items(): Draw.MolToFile(m, f"fig/{n}.png", size=(700,450))
+print(json.dumps({k:v for k,v in out.items() if k!="potency"}, indent=1, default=str))
